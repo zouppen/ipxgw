@@ -37,6 +37,16 @@
 #define IPXBUFFERSIZE 1424				// From DosBox
 #undef DEBUG							// More output if defined
 
+/*!
+ * \brief In Winsock, a socket handle is of type SOCKET; in UN*X, it's
+ * a file descriptor, and therefore a signed integer.
+ * We define SOCKET to be a signed integer on UN*X, so that it can
+ * be used on both platforms. (from pcap/socket.h)
+ */
+#ifndef SOCKET
+#define SOCKET int
+#endif
+
 // From DosBox
 typedef Bit32u RealPt;
 
@@ -83,6 +93,13 @@ struct packetBuffer {
 	bool inPacket;      // In packet reception flag
 	bool connected;		// Connected flag
 	bool waitsize;
+};
+
+// Hack to allow SDLNet pollable pcap socket. Adapted from
+// SDLnetselect.c in SDL_Net
+struct Pcap_Socket {
+	int ready;
+	SOCKET channel;
 };
 
 // Some globally shared variables
@@ -187,6 +204,9 @@ static void ackClient(IPaddress clientAddr) {
 	regPacket.address = clientAddr;
 	// Send registration string to client.  If client doesn't get this, client will not be registered
 	result = SDLNet_UDP_Send(ipxServerSocket,-1,&regPacket);
+	if(result == 0) {
+		printf("IPXSERVER: %s\n", SDLNet_GetError());
+	}
 }
 
 // From DosBox ipxserver.cpp - receive packet and hand over to other clients
@@ -395,6 +415,24 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+ 	// Craft an SDL_net pollable pcap socket
+	struct Pcap_Socket sdlnet_pcap = {0, pcap_get_selectable_fd(handle)};
+	if (sdlnet_pcap.channel == PCAP_ERROR) {
+		errx(1, "Unable to get fd from pcap device\n");
+	}
+	
+	// Create SDL_net socket set
+	SDLNet_SocketSet socketSet = SDLNet_AllocSocketSet(2);
+	if(!socketSet) {
+		errx(1, "SDLNet_AllocSocketSet: %s\n", SDLNet_GetError());
+	}
+	if (SDLNet_UDP_AddSocket(socketSet, ipxServerSocket) == -1) {
+		errx(1, "SDLNet_AddSocket: %s\n", SDLNet_GetError());
+	}
+	if (SDLNet_UDP_AddSocket(socketSet, &sdlnet_pcap) == -1) {
+		errx(1, "SDLNet_AddSocket: %s\n", SDLNet_GetError());
+	}
+	
 	printf("\nYou can now write somewhere, on some DOSBox(es):\nIPXNET CONNECT <this host's ip> %i\n", port);
 	printf("Then, start IPX networking on real DOS computer(s) connected to %s.\n", device);
 	printf("Now you can start playing IPX games between them.\n\n");
@@ -406,8 +444,16 @@ int main(int argc, char *argv[])
 	// Main loop for exchanging packets and accepting connections
 	for(;;)
 	{
-		pcap_to_dosbox();
-		IPX_ServerLoop();
+		SDLNet_CheckSockets(socketSet, -1);
+		if (sdlnet_pcap.ready) {
+			pcap_to_dosbox();
+			// Setting socket status manually to non-ready
+			// because read it outside SDLNet.
+			sdlnet_pcap.ready = 0;
+		}
+		if (SDLNet_SocketReady(ipxServerSocket)) {
+			IPX_ServerLoop();
+		}
 	}
 
 	return 0;
